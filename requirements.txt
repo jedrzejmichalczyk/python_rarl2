@@ -1,0 +1,17 @@
+# Core dependencies
+numpy>=1.20.0
+scipy>=1.7.0
+torch>=1.10.0
+matplotlib>=3.3.0
+
+# Optional: For MKL optimization (if available)
+# mkl>=2021.4.0
+# mkl-service>=2.4.0
+
+# Development dependencies (install with pip install -r requirements-dev.txt)
+# pytest>=6.0
+# pytest-cov
+# black
+# flake8
+# mypy
+# jupyter

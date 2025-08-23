@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rarl2"
+description = "Optimal H2 model reduction via RARL2 algorithm"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Your Name", email = "your.email@example.com"},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "numpy>=1.20.0",
+    "scipy>=1.7.0",
+    "torch>=1.10.0",
+    "matplotlib>=3.3.0",
+]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "pytest-cov",
+    "black",
+    "flake8",
+    "mypy",
+    "jupyter",
+]
+docs = [
+    "sphinx",
+    "sphinx-rtd-theme",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/rarl2"
+Documentation = "https://rarl2.readthedocs.io"
+Repository = "https://github.com/yourusername/rarl2"
+Issues = "https://github.com/yourusername/rarl2/issues"
+
+[tool.setuptools_scm]
+write_to = "src/rarl2/_version.py"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --cov=rarl2 --cov-report=html --cov-report=term"
+
+[tool.black]
+line-length = 88
+target-version = ['py38', 'py39', 'py310', 'py311']
+include = '\.pyi?$'
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 88
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "SIM", "ARG"]
+ignore = ["E501", "B008"]
+target-version = "py38"
