@@ -50,16 +50,25 @@ Issues = "https://github.com/yourusername/rarl2/issues"
 write_to = "src/rarl2/_version.py"
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+# Discover tests from the project root and ignore legacy experiments
+# under old_attempts. Keep existing addopts for coverage.
+testpaths = ["."]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+norecursedirs = [
+  "old_attempts",
+  "venv",
+  "__pycache__",
+  ".git",
+  ".idea",
+]
 addopts = "-v --cov=rarl2 --cov-report=html --cov-report=term"
 
 [tool.black]
 line-length = 88
 target-version = ['py38', 'py39', 'py310', 'py311']
-include = '\.pyi?$'
+include = '\\.pyi?$'
 
 [tool.mypy]
 python_version = "3.8"
