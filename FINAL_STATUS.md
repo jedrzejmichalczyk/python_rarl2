@@ -1,18 +1,29 @@
 # RARL2 Implementation - Final Status Report
 
 **Date**: 2026-01-08
-**Status**: FULLY WORKING - All tests pass, up to order 10 systems optimized successfully
+**Status**: FULLY WORKING - Dual-input support (State-Space and Fourier Coefficients)
 
 ---
 
 ## Executive Summary
 
-The RARL2 (Rational Approximation in the Real Lossless bounded-real Lemma) implementation is now **fully functional**. After fixing several critical issues, the implementation:
+The RARL2 (Rational Approximation in the Real Lossless bounded-real Lemma) implementation is now **fully functional** with **two input modes**:
 
-- Achieves **machine-precision accuracy** (< 1e-10) on lossless-to-lossless approximation
-- Achieves **89% average improvement** over balanced truncation on model reduction
+### State-Space Input (`torch_chart_optimizer.py`)
+- Target specified as (A, B, C, D) matrices
+- Uses analytical concentrated criterion
+- Achieves **89% average improvement** over balanced truncation
+
+### Fourier Coefficient Input (`fourier_rarl2.py`) - NEW
+- Target specified as Markov parameters {F_0, F_1, ..., F_K}
+- Direct H2 optimization without state-space conversion
+- Achieves **up to 99.6% improvement** (includes optimal feedthrough term)
+- **More complete** than state-space version
+
+### Key Metrics
+- **Machine-precision accuracy** (< 1e-10) on lossless-to-lossless approximation
 - Successfully optimizes systems **up to order 20 → 10** in reasonable time (~25 seconds max)
-- All **14 test cases pass** across scalar, MIMO, and high-order configurations
+- All **22 test cases pass** (8 Fourier + 4 state-space + 10 high-order)
 
 ---
 
@@ -141,7 +152,9 @@ Target F → Balanced Truncation → Chart Center (W,X,Y,Z)
 
 ---
 
-## Usage Example
+## Usage Examples
+
+### State-Space Input
 
 ```python
 import numpy as np
@@ -182,6 +195,43 @@ for i in range(30):
 # Get result
 A_opt, B_opt, C_opt, D_opt = model.current_system()
 ```
+
+### Fourier Coefficient Input (NEW)
+
+```python
+import numpy as np
+from fourier_rarl2 import optimize_fourier_rarl2, statespace_to_markov
+
+# Option 1: Convert state-space to Markov parameters
+A_F = np.array([[0.9, 0.1], [0.0, 0.8]], dtype=np.complex128)
+B_F = np.array([[1.0], [0.5]], dtype=np.complex128)
+C_F = np.array([[1.0, 0.0]], dtype=np.complex128)
+D_F = np.zeros((1, 1), dtype=np.complex128)
+K = 40  # Number of Markov parameters
+F_markov = statespace_to_markov(A_F, B_F, C_F, D_F, K)
+
+# Option 2: Use Markov parameters directly (e.g., from frequency data)
+# F_markov = [F_0, F_1, F_2, ..., F_K]  # List of p×m matrices
+
+# Optimize
+order = 1
+H_markov, final_error, info = optimize_fourier_rarl2(
+    F_markov, n=order, max_iter=50, verbose=True
+)
+
+# Result: H_markov is the optimal approximation as Markov parameters
+# H_0 = D_opt, H_k = C_opt @ A_opt^{k-1} @ B_opt
+```
+
+### When to Use Each Method
+
+| Use Case | Recommended Method |
+|----------|-------------------|
+| Target given as (A,B,C,D) | State-Space |
+| Target given as frequency response | Fourier |
+| Target given as impulse response | Fourier |
+| Maximum accuracy needed | Fourier (includes optimal D) |
+| Memory constrained | State-Space |
 
 ---
 
@@ -224,21 +274,24 @@ A_opt, B_opt, C_opt, D_opt = model.current_system()
 ## Files
 
 ### Core Implementation
-- `torch_chart_optimizer.py` - Main optimizer
+- `torch_chart_optimizer.py` - State-space RARL2 optimizer
+- `fourier_rarl2.py` - **NEW** Fourier coefficient RARL2 optimizer
 - `balanced_truncation.py` - BT initialization
 - `lossless_embedding_torch.py` - Lossless embedding
 - `cross_gramians.py` - Cross-Gramian utilities
 - `bop.py` - BOP chart (NumPy version)
 
 ### Tests
-- `test_rarl2_complete.py` - Core functionality tests
-- `test_rarl2_high_order.py` - High-order stress tests
+- `test_rarl2_complete.py` - Core state-space tests (4 tests)
+- `test_rarl2_high_order.py` - High-order stress tests (10 tests)
+- `test_fourier_rarl2.py` - **NEW** Fourier RARL2 tests (8 tests)
 - `test_scalar_fix.py` - Scalar lossless tests
 - `test_analytical_h2.py` - H2 norm verification
 
 ### Documentation
 - `FINAL_STATUS.md` - This file
 - `RARL2_ALGORITHM_REFERENCE.md` - Algorithm details
+- `CRITICAL_ANALYSIS_DUAL_INPUT.md` - **NEW** Dual-input analysis
 - `CRITICAL_ANALYSIS_OLIVI_VS_IMPLEMENTATION.md` - Paper comparison
 - `CLAUDE.md` - Project guidelines
 
@@ -246,13 +299,35 @@ A_opt, B_opt, C_opt, D_opt = model.current_system()
 
 ## Conclusion
 
-The RARL2 implementation is now **production-ready** for systems up to order 10-20. Key achievements:
+The RARL2 implementation is now **production-ready** with **dual-input support**:
 
-1. **Exact analytical H2 norm** - No approximation error
-2. **Robust initialization** - From balanced truncation
-3. **Full differentiability** - PyTorch autograd throughout
-4. **89% average improvement** over balanced truncation
-5. **All tests passing** - Scalar, MIMO, and high-order
+### Key Achievements
+
+1. **Two Input Modes**:
+   - State-space (A, B, C, D) matrices
+   - Fourier coefficients (Markov parameters)
+
+2. **Exact H2 Optimization**:
+   - Analytical formulas (no frequency sampling)
+   - Fourier version includes optimal feedthrough term
+
+3. **Full Differentiability**:
+   - PyTorch autograd throughout
+   - Verified gradients to 1e-9 relative error
+
+4. **Performance**:
+   - State-space: 89% average improvement over BT
+   - Fourier: up to 99.6% improvement
+   - Systems up to order 20→10 in <30 seconds
+
+5. **Comprehensive Testing**:
+   - 22 tests passing (8 Fourier + 4 state-space + 10 high-order)
+   - Scalar, SISO, MIMO configurations verified
+
+### When to Use Which
+
+- **State-Space**: When target is given as matrices, memory constrained
+- **Fourier**: When target is frequency/impulse data, or maximum accuracy needed
 
 For larger systems or cases where BT initialization is poor, consider implementing chart switching.
 
