@@ -94,14 +94,21 @@ class TorchBOP(nn.Module):
         Sinv = Z / sqrt_c
         return S, Sinv
 
-    def forward(self, V: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Given V (m x n, complex), produce (A, C) through Λ normalization.
+    def forward(self, V: torch.Tensor, debug=False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Given V (p x n, complex), produce lossless (A, B, C, D).
+
+        Args:
+            V: Parameter matrix with shape (p, n) where p=Y.shape[0] (output dim)
+
         Steps:
           - Solve P - W^H P W = - (V^H V - Y^H Y)
           - Stabilize P via Hermitization and Gershgorin-based diagonal shift
           - Compute Λ and Λ^{-1} via Newton–Schulz (differentiable)
           - A = Λ W Λ^{-1}, C = (Y + V) Λ^{-1}
+          - Complete to lossless via (B,D) = lossless_embedding(C,A)
         """
+        from lossless_embedding_torch import lossless_embedding_torch, verify_lossless_torch
+
         # Stein for P
         RHS = V.conj().T @ V - self.Y.conj().T @ self.Y
         P = solve_two_sided_stein(self.W.conj().T, self.W, -RHS)
@@ -112,15 +119,51 @@ class TorchBOP(nn.Module):
         row_sum_off = absP.sum(dim=1) - torch.abs(torch.diagonal(P))
         diag_real = torch.real(torch.diagonal(P))
         lower_bd = torch.min(diag_real - row_sum_off)
-        shift_pd = torch.clamp(1e-6 - lower_bd, min=0.0).to(P.dtype)
+        shift_pd = torch.clamp(1e-6 - lower_bd, min=0.0)  # Keep as real
         if shift_pd.item() > 0:
             P = P + shift_pd * torch.eye(P.shape[0], dtype=P.dtype, device=P.device)
-        # Newton–Schulz sqrt and invsqrt
-        Lambda, Lambda_inv = self._matrix_sqrt_invsqrt_ns(P, iters=30)
-        # A and C
+        # Newton–Schulz sqrt and invsqrt (more iterations for precision)
+        Lambda, Lambda_inv = self._matrix_sqrt_invsqrt_ns(P, iters=50)
+
+        if debug:
+            # Verify Lambda^H * Lambda ≈ P
+            check = Lambda.conj().T @ Lambda
+            print(f"  [DEBUG] P verification: ||Lambda^H*Lambda - P|| = {torch.norm(check - P).item():.6e}")
+
+        # A and C from chart
         A = Lambda @ self.W @ Lambda_inv
         C = (self.Y + V) @ Lambda_inv
-        return A, C
+
+        # CRITICAL: Explicitly enforce output normal via QR
+        # Stack [A; C] and orthonormalize
+        stacked = torch.cat([A, C], dim=0)  # (n+p) x n
+        Q, R = torch.linalg.qr(stacked)
+
+        # FIX PHASE AMBIGUITY: Ensure R has positive diagonal
+        # This makes QR decomposition unique and prevents sign flips
+        signs = torch.sign(torch.real(torch.diagonal(R)))
+        signs = torch.where(signs == 0, torch.ones_like(signs), signs)  # Handle zeros
+        Q = Q @ torch.diag(signs.to(Q.dtype))
+        R = torch.diag(signs.to(R.dtype)) @ R
+
+        A = Q[:self.n, :]
+        C = Q[self.n:, :]
+
+        if debug:
+            # Check output normal AFTER orthonormalization
+            ON = A.conj().T @ A + C.conj().T @ C
+            I = torch.eye(A.shape[0], dtype=A.dtype, device=A.device)
+            print(f"  [DEBUG] Output normal (A,C): ||A^H*A + C^H*C - I|| = {torch.norm(ON - I).item():.6e}")
+
+        # Complete to lossless system
+        B, D = lossless_embedding_torch(C, A, nu=1.0)
+
+        if debug:
+            # Verify losslessness
+            loss_err = verify_lossless_torch(A, B, C, D)
+            print(f"  [DEBUG] Lossless check: ||G^H*G - I||_max = {loss_err.item():.6e}")
+
+        return A, B, C, D
 
 
 def compute_optimal_B_torch(A: torch.Tensor, C: torch.Tensor,
@@ -147,6 +190,7 @@ def frequency_response_torch(A, B, C, D, z):
 
 
 def h2_error_torch(sys1: Tuple[torch.Tensor, ...], sys2: Tuple[torch.Tensor, ...], num_samples: int = 128) -> torch.Tensor:
+    """Frequency-sampled H2 error (LEGACY - use h2_error_analytical instead)."""
     A1, B1, C1, D1 = sys1
     A2, B2, C2, D2 = sys2
     device = A1.device
@@ -159,6 +203,132 @@ def h2_error_torch(sys1: Tuple[torch.Tensor, ...], sys2: Tuple[torch.Tensor, ...
         E = H1 - H2
         acc = acc + torch.sum(torch.abs(E) ** 2).real
     return acc / num_samples
+
+
+def h2_norm_squared_torch(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, D: torch.Tensor) -> torch.Tensor:
+    """Compute ||H||²₂ for discrete-time system H(z) = D + C(zI-A)⁻¹B.
+
+    Uses the observability Gramian Q satisfying A^H Q A - Q = -C^H C.
+    Then ||H||²₂ = Tr(B^H Q B) + Tr(D^H D).
+    """
+    n = A.shape[0]
+    if n == 0:
+        # Static gain only
+        return torch.sum(torch.abs(D) ** 2).real
+
+    # Solve discrete Lyapunov: A^H Q A - Q = -C^H C
+    Q = solve_discrete_lyapunov_torch(A, C.conj().T @ C)
+
+    # H2 norm squared = Tr(B^H Q B) + Tr(D^H D)
+    h2_sq = torch.trace(B.conj().T @ Q @ B).real
+    if D is not None and D.numel() > 0:
+        h2_sq = h2_sq + torch.sum(torch.abs(D) ** 2).real
+
+    return h2_sq
+
+
+def h2_error_analytical_torch(
+    A_F: torch.Tensor, B_F: torch.Tensor, C_F: torch.Tensor, D_F: torch.Tensor,
+    A: torch.Tensor, C: torch.Tensor
+) -> torch.Tensor:
+    """Compute the EXACT H2 error using the concentrated criterion from paper eq. (9).
+
+    J_n(C, A) = ||F||²₂ - Tr(B_F^H · Q₁₂ · Q₁₂^H · B_F)
+
+    This gives the minimum H2 error achievable with dynamics (A, C) and optimal B̂.
+    No frequency sampling - exact analytical formula.
+
+    NOTE: This is for LOSSY approximation. For lossless-to-lossless, use
+    h2_error_lossless_torch() instead.
+
+    Args:
+        A_F, B_F, C_F, D_F: Target system F
+        A, C: Approximation dynamics (output normal)
+
+    Returns:
+        J_n(C, A): The optimal H2 error for this (A, C) pair
+    """
+    # Step 1: Compute ||F||²₂
+    F_norm_sq = h2_norm_squared_torch(A_F, B_F, C_F, D_F)
+
+    # Step 2: Compute cross-Gramian Q₁₂ solving A_F^H Q₁₂ A + C_F^H C = Q₁₂
+    L = A_F.conj().T
+    R = A
+    RHS = C_F.conj().T @ C
+    Q12 = solve_two_sided_stein(L, R, RHS)
+
+    # Step 3: Concentrated criterion from eq. (9)
+    # J_n = ||F||² - Tr(B_F^H Q₁₂ Q₁₂^H B_F)
+    reduction = torch.trace(B_F.conj().T @ Q12 @ Q12.conj().T @ B_F).real
+
+    J_n = F_norm_sq - reduction
+
+    # Ensure non-negative (numerical errors can make it slightly negative)
+    return torch.clamp(J_n, min=0.0)
+
+
+def h2_error_lossless_torch(
+    A_F: torch.Tensor, B_F: torch.Tensor, C_F: torch.Tensor, D_F: torch.Tensor,
+    A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, D: torch.Tensor
+) -> torch.Tensor:
+    """Compute EXACT H2 error ||F - G||² between two systems analytically.
+
+    Uses: ||F - G||² = ||F||² - 2·Re·Tr(cross terms) + ||G||²
+
+    For discrete-time systems, the cross term involves solving a Sylvester equation.
+
+    Args:
+        A_F, B_F, C_F, D_F: Target system F
+        A, B, C, D: Approximation system G
+
+    Returns:
+        ||F - G||²₂
+    """
+    # ||F||²
+    F_norm_sq = h2_norm_squared_torch(A_F, B_F, C_F, D_F)
+
+    # ||G||²
+    G_norm_sq = h2_norm_squared_torch(A, B, C, D)
+
+    # Cross term: 2·Re·Tr(inner product)
+    # <F, G> = Tr(C_F Σ C^H) + Tr(D_F^H D) where Σ solves A_F Σ A^H + B_F B^H = Σ
+    # Actually for inner product: <F, G> = Tr(C_F X C^H) + Tr(D_F^H D)
+    # where X solves the Sylvester equation A_F X A^H + B_F B^H = X
+
+    # Solve X = A_F X A^H + B_F B^H
+    # This is: X - A_F X A^H = B_F B^H
+    n_F = A_F.shape[0]
+    n = A.shape[0]
+
+    if n_F == 0 and n == 0:
+        # Both static gains
+        cross = torch.trace(D_F.conj().T @ D).real
+        return F_norm_sq - 2 * cross + G_norm_sq
+
+    # Solve Sylvester equation for cross-Gramian
+    # X - A_F X A^H = B_F B^H
+    # Vectorized: (I - A^* ⊗ A_F) vec(X) = vec(B_F B^H)
+    I = torch.eye(n_F * n, dtype=A_F.dtype, device=A_F.device)
+    K = I - kron(A.conj(), A_F)
+    RHS = B_F @ B.conj().T
+    b = RHS.permute(1, 0).contiguous().view(-1)
+
+    try:
+        vecX = torch.linalg.solve(K, b)
+    except RuntimeError:
+        vecX = torch.linalg.lstsq(K, b).solution
+
+    X = vecX.view(n, n_F).permute(1, 0).contiguous()
+
+    # Cross term: Tr(C_F X C^H) + Tr(D_F^H D)
+    cross = torch.trace(C_F @ X @ C.conj().T).real
+    if D_F is not None and D is not None and D_F.numel() > 0 and D.numel() > 0:
+        cross = cross + torch.trace(D_F.conj().T @ D).real
+
+    # ||F - G||² = ||F||² - 2·Re<F,G> + ||G||²
+    error_sq = F_norm_sq - 2 * cross + G_norm_sq
+
+    return torch.clamp(error_sq, min=0.0)
 
 
 class ChartRARL2Torch(nn.Module):
@@ -174,6 +344,10 @@ class ChartRARL2Torch(nn.Module):
         self.X = torch.tensor(X, dtype=torch.complex128)
         self.Y = torch.tensor(Y, dtype=torch.complex128)
         self.Z = torch.tensor(Z, dtype=torch.complex128)
+
+        # Infer output dimension p from Y shape
+        self.p = Y.shape[0]
+
         self.bop = TorchBOP(self.W, self.X, self.Y, self.Z)
         # Target to torch complex
         A_F, B_F, C_F, D_F = target
@@ -181,18 +355,72 @@ class ChartRARL2Torch(nn.Module):
         self.register_buffer("B_F", torch.tensor(B_F, dtype=torch.complex128))
         self.register_buffer("C_F", torch.tensor(C_F, dtype=torch.complex128))
         self.register_buffer("D_F", torch.tensor(D_F, dtype=torch.complex128))
-        # Parameters V (real-valued)
-        self.V_real = nn.Parameter(torch.randn(m, n, dtype=torch.float64) * 0.05)
-        self.V_imag = nn.Parameter(torch.randn(m, n, dtype=torch.float64) * 0.05)
+        # Parameters V (real-valued) - shape should be (p, n) not (m, n)!
+        self.V_real = nn.Parameter(torch.randn(self.p, n, dtype=torch.float64) * 0.05)
+        self.V_imag = nn.Parameter(torch.randn(self.p, n, dtype=torch.float64) * 0.05)
 
     def current_system(self) -> Tuple[torch.Tensor, ...]:
-        V = torch.complex(self.V_real, self.V_imag)
-        A, C = self.bop(V)
-        B_hat = compute_optimal_B_torch(A, C, self.A_F, self.B_F, self.C_F)
-        D_hat = torch.zeros((self.C_F.shape[0], self.B_F.shape[1]), dtype=torch.complex128, device=A.device)
-        return A, B_hat, C, D_hat
+        """
+        Get current system for optimization.
 
-    def forward(self) -> torch.Tensor:
-        A, B_hat, C, D_hat = self.current_system()
-        loss = h2_error_torch((self.A_F, self.B_F, self.C_F, self.D_F), (A, B_hat, C, D_hat), num_samples=64)
-        return loss
+        For LOSSLESS target: Return lossless G directly
+        For LOSSY target: Return lossy H = (A, B̂, C, D̂)
+        """
+        V = torch.complex(self.V_real, self.V_imag)
+        # Get lossless G from chart
+        A, B_lossless, C, D_lossless = self.bop(V)
+
+        # Check if target is lossless (for 1D case, this is true)
+        # If target is lossless, we should approximate it with lossless G!
+        from lossless_embedding_torch import verify_lossless_torch
+        target_lossless_err = verify_lossless_torch(self.A_F, self.B_F, self.C_F, self.D_F)
+
+        if target_lossless_err < 1e-10:
+            # Target is lossless - approximate with lossless G
+            return A, B_lossless, C, D_lossless
+        else:
+            # Target is lossy - compute lossy H via necessary conditions
+            B_hat = compute_optimal_B_torch(A, C, self.A_F, self.B_F, self.C_F)
+            D_hat = torch.zeros((self.C_F.shape[0], self.B_F.shape[1]), dtype=torch.complex128, device=A.device)
+            return A, B_hat, C, D_hat
+
+    def forward(self, use_analytical: bool = True) -> torch.Tensor:
+        """Compute H2 error.
+
+        Args:
+            use_analytical: If True, use exact analytical formula.
+                           If False, use legacy frequency sampling (for comparison).
+
+        For LOSSLESS targets: Uses ||F - G||² where G is the lossless approximation.
+        For LOSSY targets: Uses concentrated criterion J_n(C, A).
+        """
+        from lossless_embedding_torch import verify_lossless_torch
+
+        V = torch.complex(self.V_real, self.V_imag)
+        A, B, C, D = self.bop(V)  # This is lossless G
+
+        # Check if target is lossless
+        target_lossless_err = verify_lossless_torch(self.A_F, self.B_F, self.C_F, self.D_F)
+
+        if use_analytical:
+            if target_lossless_err < 1e-10:
+                # Target is lossless - use direct ||F - G||² between lossless systems
+                loss = h2_error_lossless_torch(
+                    self.A_F, self.B_F, self.C_F, self.D_F,
+                    A, B, C, D
+                )
+            else:
+                # Target is lossy - use concentrated criterion for optimal lossy approx
+                loss = h2_error_analytical_torch(
+                    self.A_F, self.B_F, self.C_F, self.D_F, A, C
+                )
+            return loss
+        else:
+            # Legacy frequency sampling approach
+            A_sys, B_sys, C_sys, D_sys = self.current_system()
+            loss = h2_error_torch(
+                (self.A_F, self.B_F, self.C_F, self.D_F),
+                (A_sys, B_sys, C_sys, D_sys),
+                num_samples=64
+            )
+            return loss

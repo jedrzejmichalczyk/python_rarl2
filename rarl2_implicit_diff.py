@@ -19,6 +19,82 @@ from typing import Tuple, Optional
 import matplotlib.pyplot as plt
 
 
+def kron(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """Kronecker product for torch tensors."""
+    a11 = A.unsqueeze(-1).unsqueeze(-3)
+    b11 = B.unsqueeze(-2).unsqueeze(-4)
+    K = a11 * b11
+    m, n = A.shape[-2], A.shape[-1]
+    p, q = B.shape[-2], B.shape[-1]
+    return K.reshape(m * p, n * q)
+
+
+def solve_discrete_lyapunov_torch(A: torch.Tensor, Q: torch.Tensor) -> torch.Tensor:
+    """Solve A^H X A - X = -Q via vectorization."""
+    n = A.shape[0]
+    I = torch.eye(n * n, dtype=A.dtype, device=A.device)
+    M = kron(A.T, A.conj()) - I
+    b = -Q.permute(1, 0).contiguous().view(-1)
+    try:
+        vecX = torch.linalg.solve(M, b)
+    except RuntimeError:
+        vecX = torch.linalg.lstsq(M, b).solution
+    X = vecX.view(n, n).permute(1, 0).contiguous()
+    return X
+
+
+def solve_two_sided_stein_torch(A_left: torch.Tensor, A_right: torch.Tensor, RHS: torch.Tensor) -> torch.Tensor:
+    """Solve X = A_left X A_right + RHS via vectorization."""
+    nL = A_left.shape[0]
+    nR = A_right.shape[0]
+    I = torch.eye(nL * nR, dtype=A_left.dtype, device=A_left.device)
+    K = I - kron(A_right.T, A_left)
+    b = RHS.permute(1, 0).contiguous().view(-1)
+    try:
+        vecX = torch.linalg.solve(K, b)
+    except RuntimeError:
+        vecX = torch.linalg.lstsq(K, b).solution
+    X = vecX.view(nR, nL).permute(1, 0).contiguous()
+    return X
+
+
+def h2_norm_squared_torch(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, D: torch.Tensor) -> torch.Tensor:
+    """Compute ||H||²₂ using observability Gramian."""
+    n = A.shape[0]
+    if n == 0:
+        return torch.sum(torch.abs(D) ** 2).real
+
+    Q = solve_discrete_lyapunov_torch(A, C.conj().T @ C)
+    h2_sq = torch.trace(B.conj().T @ Q @ B).real
+    if D is not None and D.numel() > 0:
+        h2_sq = h2_sq + torch.sum(torch.abs(D) ** 2).real
+    return h2_sq
+
+
+def h2_error_analytical_torch(
+    A_F: torch.Tensor, B_F: torch.Tensor, C_F: torch.Tensor, D_F: torch.Tensor,
+    A: torch.Tensor, C: torch.Tensor
+) -> torch.Tensor:
+    """Compute EXACT H2 error using concentrated criterion from paper eq. (9).
+
+    J_n(C, A) = ||F||²₂ - Tr(B_F^H · Q₁₂ · Q₁₂^H · B_F)
+    """
+    # Step 1: Compute ||F||²₂
+    F_norm_sq = h2_norm_squared_torch(A_F, B_F, C_F, D_F)
+
+    # Step 2: Compute cross-Gramian Q₁₂
+    L = A_F.conj().T
+    R = A
+    RHS = C_F.conj().T @ C
+    Q12 = solve_two_sided_stein_torch(L, R, RHS)
+
+    # Step 3: Concentrated criterion
+    reduction = torch.trace(B_F.conj().T @ Q12 @ Q12.conj().T @ B_F).real
+
+    J_n = F_norm_sq - reduction
+    return torch.clamp(J_n, min=0.0)
+
+
 def solve_coupled_sylvester_torch(
     A: torch.Tensor, A_F: torch.Tensor,
     C: torch.Tensor, C_F: torch.Tensor,
@@ -268,25 +344,37 @@ class RARL2WithImplicitDiff(nn.Module):
         
         return error_sum / num_samples
     
-    def forward(self) -> torch.Tensor:
+    def forward(self, use_analytical: bool = True) -> torch.Tensor:
         """
         Complete forward pass.
-        
+
+        Args:
+            use_analytical: If True, use exact analytical H2 formula.
+                           If False, use legacy frequency sampling.
+
         Returns:
             Loss: ||F - H||²₂
         """
         # Step 1: V → (C,A)
         C, A = self.v_to_output_normal()
-        
-        # Step 2: (C,A) → optimal (B̂,D̂) via H2 projection
-        B_hat, D_hat = self.h2_proj(C, A, self.A_F, self.B_F, self.C_F, self.D_F)
-        
-        # Step 3: Compute objective ||F - H||²
-        loss = self.compute_h2_norm_discrete(
-            self.A_F, self.B_F, self.C_F, self.D_F,
-            A, B_hat, C, D_hat
-        )
-        
+
+        if use_analytical:
+            # Use exact concentrated criterion from paper eq. (9)
+            # This gives the optimal error for this (A, C) directly
+            loss = h2_error_analytical_torch(
+                self.A_F, self.B_F, self.C_F, self.D_F, A, C
+            )
+        else:
+            # Legacy approach with frequency sampling
+            # Step 2: (C,A) → optimal (B̂,D̂) via H2 projection
+            B_hat, D_hat = self.h2_proj(C, A, self.A_F, self.B_F, self.C_F, self.D_F)
+
+            # Step 3: Compute objective ||F - H||² via frequency sampling
+            loss = self.compute_h2_norm_discrete(
+                self.A_F, self.B_F, self.C_F, self.D_F,
+                A, B_hat, C, D_hat
+            )
+
         return loss
     
     def get_current_system(self) -> Tuple[np.ndarray, ...]:
